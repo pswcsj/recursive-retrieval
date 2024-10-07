@@ -2,3 +2,6 @@
 data
 .env
 result.json
+
+# pycache
+__pycache__/
