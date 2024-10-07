@@ -1,0 +1,3 @@
+[submodule "toggle-box"]
+	path = togglebox
+	url = https://github.com/Togglecampus/toggle-box.git

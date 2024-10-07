@@ -20,7 +20,7 @@ from retriever.hybrid import VectorBM25
 from llama_index.core.retrievers import BaseRetriever
 from llama_index.core.schema import NodeWithScore, QueryBundle
 
-tokenizer = tiktoken.get_encoding("o200k_base")
+tokenizer = tiktoken.encoding_for_model("gpt-4o-mini")
 
 TOKEN_LIMIT = 32000
 
@@ -38,6 +38,7 @@ class Workflow:
         self,
         lexical_graph: Optional[LexicalGraphBuilder] = None,
         retriever: Optional[BaseRetriever] = None,
+        local_nodes_map: Optional[Dict[str, MultiAgentSearchLocalNode]] = None,
     ):
         self.graph = StateGraph(AgentState)
         self._lexical_graph = (
@@ -53,21 +54,25 @@ class Workflow:
             else VectorBM25(vector_top_k=5, bm25_top_k=20, mode="OR")
         )
         self.openai_client = self.setup_openai_client()
-        self.local_nodes_map: Dict[str, MultiAgentSearchLocalNode] = {}
 
-        for node, data in self._lexical_graph.nodes(data=True):
-            print(f"Processing node: {node}")
-            content = (
-                data["content"]
-                if "content" in data and data["content"] != ""
-                else "(empty content)"
-            )
-            if len(content) > 10000:
-                content = content[:10000] + "..."
-            self.local_nodes_map[node] = MultiAgentSearchLocalNode(
-                unique_id=node,
-                content=content,
-            )
+        if local_nodes_map:
+            self.local_nodes_map = local_nodes_map
+        else:
+            self.local_nodes_map: Dict[str, MultiAgentSearchLocalNode] = {}
+
+            for node, data in self._lexical_graph.nodes(data=True):
+                print(f"Processing node: {node}")
+                content = (
+                    data["content"]
+                    if "content" in data and data["content"] != ""
+                    else "(empty content)"
+                )
+                if len(content) > 10000:
+                    content = content[:10000] + "..."
+                self.local_nodes_map[node] = MultiAgentSearchLocalNode(
+                    unique_id=node,
+                    content=content,
+                )
 
     def retrieve(self, query: str) -> List[MultiAgentSearchLocalNode]:
         retrieved_nodes: List[NodeWithScore] = self._retriever.retrieve(
@@ -130,18 +135,18 @@ class Workflow:
         """
 
         starter_prompt = f"""
-        당신은 문서에서 검색된 노드의 후처리 필터링을 담당하는 지능형 에이전트입니다. 노드는 다음 질의에 대한 답변을 제공해야 합니다: 
-        ```{query}```
+        You are an intelligent agent responsible for post-processing filtering of nodes retrieved from a document. You should provide answers to the following query: 
+        '''{query}'''
         
-        아래는 자동으로 검색된 노드 목록입니다. 당신의 임무는 질의와 관련이 없는 노드를 식별하고, 그 노드가 제거되어야 하는 짧은 이유를 제시하는 것입니다.
+        Below is a list of automatically retrieved nodes. Your task is to identify the nodes that are not relevant to the query and provide a short reason why they should be removed.
 
-        이 태스크는 recall이 매우 중요한 작업이니, 정말로 관련이 없는 것만 제거하고, 조금이라도 필요할 것 같은 정보는 절대 제거하지 마십시오.
+        This task is very important to recall, so only remove what is truly irrelevant, and never remove information that you think you might need in the slightest. And you must not remove all nodes, you must keep at least two node.
         
-        노드를 삭제하면 해당 노드 내의 모든 하위 노드도 함께 삭제된다는 점에 유의하십시오.
+        Note that deleting a node also deletes all child nodes within that node.
 
-        노드는 node_id로 식별됩니다. (node_id, reason)의 목록을 반환하고, 이유는 해당 노드가 삭제되어야 하는 짧은 설명이어야 합니다. node_ids는 백틱(`)으로 묶어야 합니다.
+        Nodes are identified by node_id. Returns a list of (node_id, reason), where reason should be a short description of why the node should be deleted. node_ids should be enclosed in backticks (`).
         
-        단계별로 신중하게 생각하여 삭제할 노드를 선택하십시오.
+        Go through the steps carefully and select the nodes you want to delete.
         """
 
         all_flattened_nodes: Dict[str, MultiAgentSearchLocalNode] = {}
@@ -294,6 +299,8 @@ class Workflow:
             ) + count_tokens_for_nodes(state["last_fetched_context_nodes"])
         except:
             tokens = TOKEN_LIMIT + 1
+            print(state["previous_nodes"])
+            print(state["last_fetched_context_nodes"])
         if tokens > TOKEN_LIMIT:
             state["markdown_debug"] += f"- warning: tokens over recommended limit\n"
             previous_nodes, changes_1 = self.prune_nodes(
@@ -302,9 +309,9 @@ class Workflow:
             last_fetched_context_nodes, changes_2 = self.prune_nodes(
                 state["query"], state["last_fetched_context_nodes"]
             )
-            new_tokens = count_tokens_for_nodes(state["previous_nodes"]) + count_tokens(
-                state["last_fetched_context_nodes"]
-            )
+            new_tokens = count_tokens_for_nodes(
+                state["previous_nodes"]
+            ) + count_tokens_for_nodes(state["last_fetched_context_nodes"])
 
             if new_tokens > TOKEN_LIMIT:
                 # raise ValueError("Too many tokens")

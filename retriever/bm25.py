@@ -1,7 +1,6 @@
-import json
-import pickle
 import time
-
+import os
+import pickle
 from typing import Any, Dict, List, Optional, cast
 
 import numpy as np
@@ -17,36 +16,45 @@ from llama_index.core.vector_stores.utils import (
     node_to_metadata_dict,
     metadata_dict_to_node,
 )
-import os
+
+from typing import Literal, Union
+
+
+DocType = Union[Literal["kifrs"], Literal["kgaap"]]
 
 DEFAULT_PERSIST_ARGS = {"similarity_top_k": "similarity_top_k", "_verbose": "verbose"}
 
-DEFAULT_PERSIST_FILENAME = "retriever.json"
+DEFAULT_PERSIST_FILENAME = "bm25_retriever.json"
 
 
 class BM25Retriever(BaseRetriever):
+
     def __init__(
         self,
+        doc_type: DocType,
         nodes: Optional[List[BaseNode]] = None,
         similarity_top_k: int = DEFAULT_SIMILARITY_TOP_K,
         callback_manager: Optional[CallbackManager] = None,
         objects: Optional[List[IndexNode]] = None,
         object_map: Optional[dict] = None,
         verbose: bool = False,
+        persist_dir: str = "storage",
+        refresh: bool = False,
     ) -> None:
         self.similarity_top_k = similarity_top_k
-        self.verbose = verbose
-        self.okt = Okt()
-
+        self.persist_dir = os.path.join(persist_dir, doc_type)
+        self.persist_path = os.path.join(self.persist_dir, DEFAULT_PERSIST_FILENAME)
         if nodes is None:
-            raise ValueError("Please pass nodes or use load_from_file=True.")
+            raise ValueError("Please pass nodes or an existing BM25 object.")
 
-        self.corpus = [node_to_metadata_dict(node) for node in nodes]
-        print("start indexing...")
-        start_time = time.time()
-        self.corpus_tokens = [self.okt.morphs(node.get_content()) for node in nodes]
-        self.bm25 = BM25Okapi(self.corpus_tokens)
-        print(f"finished indexing within {time.time() - start_time} seconds")
+        if not refresh and os.path.exists(self.persist_path):
+            self.load_index()
+        else:
+            if nodes is None:
+                raise ValueError(
+                    "Please pass nodes or set refresh=False with an existing persisted index."
+                )
+            self.build_index(nodes)
 
         super().__init__(
             callback_manager=callback_manager,
@@ -55,14 +63,49 @@ class BM25Retriever(BaseRetriever):
             verbose=verbose,
         )
 
+    def build_index(self, nodes: List[BaseNode]):
+        self.corpus = [node_to_metadata_dict(node) for node in nodes]
+        self.okt = Okt()
+        print("Start indexing...")
+        self.corpus_tokens = [self.okt.morphs(node.get_content()) for node in nodes]
+        self.bm25 = BM25Okapi(self.corpus_tokens)
+        print("Finished indexing")
+        self.persist_index()
+
+    def persist_index(self):
+        os.makedirs(self.persist_dir, exist_ok=True)
+        with open(self.persist_path, "wb") as f:
+            pickle.dump(
+                {
+                    "corpus": self.corpus,
+                    "corpus_tokens": self.corpus_tokens,
+                    "bm25": self.bm25,
+                },
+                f,
+            )
+        print(f"BM25 index persisted to {self.persist_path}")
+
+    def load_index(self):
+        print(f"Loading BM25 index from {self.persist_path}")
+        with open(self.persist_path, "rb") as f:
+            data = pickle.load(f)
+        self.corpus = data["corpus"]
+        self.corpus_tokens = data["corpus_tokens"]
+        self.bm25 = data["bm25"]
+        self.okt = Okt()
+        print("BM25 index loaded successfully")
+
     @classmethod
     def from_defaults(
         cls,
+        doc_type: DocType,
         index: Optional[VectorStoreIndex] = None,
         nodes: Optional[List[BaseNode]] = None,
         docstore: Optional[BaseDocumentStore] = None,
         similarity_top_k: int = DEFAULT_SIMILARITY_TOP_K,
         verbose: bool = False,
+        persist_dir: str = "storage",
+        refresh: bool = False,
         # deprecated
     ) -> "BM25Retriever":
 
@@ -81,74 +124,13 @@ class BM25Retriever(BaseRetriever):
         ), "Please pass exactly one of index, nodes, or docstore."
 
         return cls(
+            doc_type=doc_type,
             nodes=nodes,
             similarity_top_k=similarity_top_k,
             verbose=verbose,
+            persist_dir=persist_dir,
+            refresh=refresh,
         )
-
-    def persist(self, directory: str):
-        """Persist the BM25Retriever object to a directory."""
-        os.makedirs(directory, exist_ok=True)
-
-        # Save simple data as JSON
-        with open(os.path.join(directory, "metadata.json"), "w") as f:
-            json.dump(
-                {"similarity_top_k": self.similarity_top_k, "verbose": self.verbose}, f
-            )
-
-        # Save corpus as JSON
-        with open(os.path.join(directory, "corpus.json"), "w") as f:
-            json.dump(self.corpus, f)
-
-        # Save corpus_tokens using pickle
-        with open(os.path.join(directory, "corpus_tokens.pkl"), "wb") as f:
-            pickle.dump(self.corpus_tokens, f)
-
-        # Save BM25Okapi object using pickle
-        with open(os.path.join(directory, "bm25.pkl"), "wb") as f:
-            pickle.dump(self.bm25, f)
-
-        if self.verbose:
-            print(f"BM25Retriever persisted to {directory}")
-
-    @classmethod
-    def load(cls, directory: str):
-        """Load a BM25Retriever object from a directory."""
-        # Load metadata
-        with open(os.path.join(directory, "metadata.json"), "r") as f:
-            metadata = json.load(f)
-
-        # Load corpus
-        with open(os.path.join(directory, "corpus.json"), "r") as f:
-            corpus = json.load(f)
-
-        # Load corpus_tokens
-        with open(os.path.join(directory, "corpus_tokens.pkl"), "rb") as f:
-            corpus_tokens = pickle.load(f)
-
-        # Load BM25Okapi object
-        with open(os.path.join(directory, "bm25.pkl"), "rb") as f:
-            bm25 = pickle.load(f)
-
-        # Create nodes from corpus
-        nodes = [metadata_dict_to_node(node_dict) for node_dict in corpus]
-
-        # Create instance
-        instance = cls(
-            nodes=nodes,
-            similarity_top_k=metadata["similarity_top_k"],
-            verbose=metadata["verbose"],
-        )
-
-        # Set loaded attributes
-        instance.corpus = corpus
-        instance.corpus_tokens = corpus_tokens
-        instance.bm25 = bm25
-
-        if instance.verbose:
-            print(f"BM25Retriever loaded from {directory}")
-
-        return instance
 
     def get_persist_args(self) -> Dict[str, Any]:
         """Get Persist Args Dict to Save."""
